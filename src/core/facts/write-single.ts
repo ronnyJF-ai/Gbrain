@@ -20,12 +20,24 @@
  *
  * Provenance (c6): callers pass free-text provenance which lands on
  * `NewFact.source` verbatim — this seam deliberately does NOT take a
- * FactsBackstopCtx (whose `source` union is pipeline-internal).
+ * FactsBackstopCtx (whose `source` union is pipeline-internal). The one
+ * exception is a connector fact whose entity resolved in another source,
+ * stored under `CROSS_SOURCE_PROVENANCE_PREFIX` (#5504).
  */
 
 import type { BrainEngine, FactInsertStatus, NewFact } from '../engine.ts';
 
 const DEDUP_THRESHOLD = 0.95;
+
+/**
+ * #5504: provenance prefix of a connector fact whose entity page lives in
+ * another federated source. The row is DB-only by construction (no page in
+ * the writing source backs it when written), so the `extract_facts`
+ * empty-fence guard must not read it as a pending v0.31 backfill row if the
+ * writing source later gains a page with the same slug. Same idiom as the
+ * `cli:` class the reconcile pass leaves alone.
+ */
+export const CROSS_SOURCE_PROVENANCE_PREFIX = 'cross-source:';
 const DEDUP_CANDIDATE_LIMIT = 5;
 
 /**
@@ -60,6 +72,14 @@ export interface SingleFactInput {
   validUntil?: Date | null;
   sessionId?: string | null;
   confidence?: number;
+  /**
+   * #5504: connector writes (`loops_extract`) resolve through
+   * resolveConnectorEntitySlug, which may name a page in another federated
+   * source. Such a fact stays in `sourceId` and takes the DB-only path: no
+   * page is created or edited in either source tree. Its provenance carries
+   * CROSS_SOURCE_PROVENANCE_PREFIX.
+   */
+  crossSourceResolution?: boolean;
 }
 
 export interface SingleFactResult {
@@ -79,7 +99,7 @@ export async function writeSingleFact(
   const { managedPersistenceEnabled } = await import('../persistence/ownership.ts');
   const managed = await managedPersistenceEnabled(engine);
 
-  const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
+  const { resolveEntitySlugWithSource, resolveConnectorEntitySlug } = await import('../entities/resolve.ts');
   const { cosineSimilarity } = await import('./classify.ts');
   const { writeFactsToFence, lookupSourceLocalPath } = await import('./fence-write.ts');
   const { isAvailable, embedOne, getEmbeddingModel } = await import('../ai/gateway.ts');
@@ -94,13 +114,20 @@ export async function writeSingleFact(
   // writeSingleFact caller (google/loops-extract, future verbs) gets the
   // same guard.
   const entityRef = isNullLikeEntity(input.entity) ? null : input.entity!.trim();
-  const resolved = entityRef
-    ? await resolveEntitySlugWithSource(engine, sourceId, entityRef)
-    : null;
+  const resolved = !entityRef
+    ? null
+    : input.crossSourceResolution
+      ? await resolveConnectorEntitySlug(engine, sourceId, entityRef)
+      : await resolveEntitySlugWithSource(engine, sourceId, entityRef);
   const resolvedSlug = entityRef ? (resolved?.slug ?? entityRef) : null;
   // #4108: provenance for the fence writer's stub guard. Null when the
   // resolver returned nothing (fail-closed — no live page was verified).
   const resolutionSource = resolved?.source ?? null;
+  // #5504: the entity's page lives in another source, so no fence in this
+  // source's tree may back the fact, and its provenance carries the prefix
+  // on both the managed and the unmanaged write path.
+  const resolvedElsewhere = resolved !== null && 'sourceId' in resolved && resolved.sourceId !== sourceId;
+  const provenance = resolvedElsewhere ? `${CROSS_SOURCE_PROVENANCE_PREFIX}${input.provenance}` : input.provenance;
 
   const { isFactWithdrawn } = await import('./withdrawal.ts');
   if (await isFactWithdrawn(engine, sourceId, visibility, factText, resolvedSlug)) {
@@ -132,7 +159,7 @@ export async function writeSingleFact(
     // unmanaged path stores it, so dedup is per entity.
     const { publishManagedEntityFacts } = await import('./managed-fact-write.ts');
     const written = await publishManagedEntityFacts(engine, sourceId, resolvedSlug, [{ fact: factText, kind, notability: 'medium',
-      source: input.provenance, visibility, confidence: input.confidence ?? 1.0, validFrom: new Date(), validUntil,
+      source: provenance, visibility, confidence: input.confidence ?? 1.0, validFrom: new Date(), validUntil,
       embedding, embedding_model: embeddingModel, sessionId: input.sessionId ?? null }], { supersede: true, attributeFallback: true });
     const [stored] = await engine.executeRaw<{ entity_slug: string | null }>('SELECT entity_slug FROM facts WHERE id=$1', [written.ids[0]]);
     return { id: written.ids[0], status: written.superseded ? 'superseded' : written.inserted ? 'inserted' : 'duplicate', entity_slug: stored?.entity_slug ?? null,
@@ -178,7 +205,7 @@ export async function writeSingleFact(
     kind,
     entity_slug: resolvedSlug,
     visibility,
-    source: input.provenance,
+    source: provenance,
     source_session: input.sessionId ?? null,
     confidence: input.confidence ?? 1.0,
     valid_until: validUntil,
@@ -187,10 +214,10 @@ export async function writeSingleFact(
   };
 
   // Fence-first write (markdown durability — same policy as the pipeline):
-  // requires a resolved, prefixed entity slug and a local_path. Everything
-  // else takes the legacy DB-only insertFact path, which also handles the
-  // supersedeId bookkeeping engine-side.
-  const localPath = resolvedSlug ? await lookupSourceLocalPath(engine, sourceId) : null;
+  // requires a resolved, prefixed entity slug in this source and a local_path.
+  // Everything else takes the legacy DB-only insertFact path, which also
+  // handles the supersedeId bookkeeping engine-side.
+  const localPath = resolvedSlug && !resolvedElsewhere ? await lookupSourceLocalPath(engine, sourceId) : null;
   const fenceable = resolvedSlug !== null && localPath !== null;
 
   if (fenceable) {

@@ -26,6 +26,7 @@ import { normalizeAlias } from '../search/alias-normalize.ts';
 import { foldNonDecomposingLatin } from '../latin-fold.ts';
 import { isUndefinedTableError } from '../utils.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+import { loadAllSources } from '../sources-load.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
@@ -288,6 +289,107 @@ export async function resolveEntitySlugWithSource(
   }
 
   return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
+}
+
+/** A resolution plus the source whose page it names. */
+export interface ConnectorResolveResult extends ResolveResult {
+  sourceId: string;
+}
+
+/**
+ * #5504: connector-path resolution (`loops_extract`, heuristic loop
+ * detection). Resolves in the writing source exactly like
+ * `resolveEntitySlugWithSource`; only when that falls back to slugify AND the
+ * writing source holds no candidate under `resolveStrictEntityReference` does
+ * it try the other non-archived `federated: true` sources, each with
+ * `resolveStrictEntityReference`: identity evidence only (exact slug, a unique
+ * slug basename before a unique alias), never fuzzy and never a bare-name
+ * prefix match, which is a guess by cardinality (`prefix_expansion`, the
+ * exact-title pick included) and so resolves only in the writing source. Only
+ * a `people/` or `companies/` page can be matched elsewhere. One contested
+ * source with such a match wins; none, or two or more sources holding
+ * candidates (a prefix candidate counts), keep the writing source's fallback.
+ * Only a writing source that is itself non-archived and configured
+ * `federated: true` looks outside itself. Other callers keep the
+ * single-source resolvers.
+ */
+export async function resolveConnectorEntitySlug(
+  engine: BrainEngine,
+  source_id: string,
+  raw: string,
+): Promise<ConnectorResolveResult | null> {
+  const own = await resolveEntitySlugWithSource(engine, source_id, raw);
+  if (!own) return null;
+  const ownResult = { ...own, sourceId: source_id };
+  if (own.source !== 'fallback_slugify') return ownResult;
+
+  const targets = await crossSourceTargets(engine, source_id);
+  if (targets.length === 0) return ownResult;
+  const trimmed = raw.trim();
+  // Own-source ambiguity (two basenames, two prefix candidates, an alias
+  // naming two live pages) is a fallback too, but never a reason to look
+  // elsewhere: the name already means more than one entity here.
+  if (holdsCandidate(await resolveStrictEntityReference(engine, source_id, trimmed))) return ownResult;
+
+  let contested = 0;
+  let hit: ConnectorResolveResult | null = null;
+  for (const target of targets) {
+    const outcome = await resolveStrictEntityReference(engine, target, trimmed);
+    if (!holdsCandidate(outcome)) continue;
+    contested++;
+    if (contested > 1) return ownResult;
+    if (outcome.slug !== null && isCrossSourceEntitySlug(outcome.slug)) {
+      hit = { slug: outcome.slug, source: STRICT_ARM_SOURCE[outcome.arm], sourceId: target };
+    }
+  }
+  return hit ?? ownResult;
+}
+
+/** Any outcome but "no page" means the source holds a candidate for the name. */
+function holdsCandidate(outcome: StrictResolution): boolean {
+  return outcome.slug !== null || outcome.miss !== 'no_page';
+}
+
+/** resolveEntitySlugWithSource's tag for each strict arm (basename is its fuzzy_match arm). */
+const STRICT_ARM_SOURCE: Record<StrictResolutionArm, ResolutionSource> = {
+  exact_page: 'exact_page',
+  alias_exact: 'alias_exact',
+  basename: 'fuzzy_match',
+  same_name: 'fuzzy_match',
+};
+
+/**
+ * Directories a cross-source match may name. The counterparty comes from
+ * LLM output over untrusted mail, so a slug-shaped name must not link a
+ * connector thread to an arbitrary page (a concept, a project) in another
+ * source. A candidate in any other directory still contests its source, so
+ * it can keep the fallback but never becomes the target.
+ */
+const CROSS_SOURCE_ENTITY_DIRS = ['people', 'companies'] as const;
+
+export function isCrossSourceEntitySlug(slug: string): boolean {
+  return CROSS_SOURCE_ENTITY_DIRS.some((dir) => slug.startsWith(`${dir}/`));
+}
+
+/**
+ * Sources a connector write may resolve into: every other non-archived source
+ * configured `federated: true` (the `isSourceFederated` inclusion rule), and
+ * none unless the writing source is itself one of them. A writer that is
+ * archived, `federated: false` or has federation unset stays inside itself:
+ * the read side (`cross-source-ref.ts`, same loader) attaches rows only from
+ * federated sources, so a row it wrote under another source's slug would
+ * reach no card.
+ */
+async function crossSourceTargets(engine: BrainEngine, source_id: string): Promise<string[]> {
+  let federated: string[];
+  try {
+    federated = (await loadAllSources(engine, { federatedOnly: true })).map((row) => row.id);
+  } catch (err) {
+    console.error(`[gbrain] cross-source entity resolution skipped for source=${source_id}: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+  if (!federated.includes(source_id)) return [];
+  return federated.filter((id) => id !== source_id);
 }
 
 /**
