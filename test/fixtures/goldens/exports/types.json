@@ -8358,6 +8358,15 @@
           "(value: unknown) => value is CRMode"
         ]
       }
+    ],
+    "./version": [
+      {
+        "kind": "variable",
+        "name": "VERSION",
+        "signature": [
+          "string"
+        ]
+      }
     ]
   },
   "normalizer": "export-types-v1"
