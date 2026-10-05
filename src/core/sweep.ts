@@ -1,4 +1,6 @@
 import { lookupRefsForSlugs } from './link-reconciliation.ts';
+import { collectWantedLinks, isWantedPagesEnabled, type WantedLinkInput } from './wanted-links.ts';
+import { lineGrammarOptions } from './line-grammar.ts';
 /**
  * Serve-resident maintenance sweep [CX-P0.1, CX-P0.3, CX2-4].
  *
@@ -410,6 +412,9 @@ async function runLinksTimelinePass(
   const linkBatch: LinkBatchInput[] = [];
   const endpointMetadata = new Map<string, { slug: string; source_id: string; type: string; knowledge_revision: string }>();
   const incomplete = new Set<string>();
+  const wantedBySlug = new Map<string, WantedLinkInput[]>();
+  const wantedEnabled = await isWantedPagesEnabled(engine);
+  const lineGrammar = await lineGrammarOptions(engine);
   if (pageCandidates.length > 0) {
     const needed = new Set<string>();
     for (const { slug, candidates } of pageCandidates) {
@@ -440,7 +445,7 @@ async function runLinksTimelinePass(
     for (const { slug } of pageCandidates) {
       const page = snapshots.get(slug)!.page;
       const { candidates, attendanceComplete } = await extractPageLinks(slug, `${page.compiled_truth}\n${page.timeline}`, page.frontmatter,
-        page.type, resolver, { skipFrontmatter: true, globalBasename, pack, targetType: (targetSlug, targetSourceId) => {
+        page.type, resolver, { skipFrontmatter: true, globalBasename, pack, lineGrammar, targetType: (targetSlug, targetSourceId) => {
           const resolved = resolveCandidateSources({ targetSlug, targetSourceId, linkType: '', context: '' }, slug,
             sourceId, allSlugs, slugToSources, allowCrossSource, { crossSource, defaultSourceId: linkDefaultSourceId });
           return resolved.ok ? endpointMetadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type : undefined;
@@ -449,6 +454,11 @@ async function runLinksTimelinePass(
         incomplete.add(slug);
         skip('attendance_resolution_incomplete');
         continue;
+      }
+      if (wantedEnabled) {
+        wantedBySlug.set(slug, collectWantedLinks({ candidates, originSourceId: sourceId,
+          crossSourceAllowed: allowCrossSource || crossSource, resolve: c => resolveCandidateSources(c, slug, sourceId,
+            allSlugs, slugToSources, allowCrossSource, { crossSource, defaultSourceId: linkDefaultSourceId }) }));
       }
       for (const c of candidates) {
         // #2589: a cross_source drop here means the target exists only in
@@ -502,7 +512,8 @@ async function runLinksTimelinePass(
         const snapshot = snapshots.get(ref.slug)!;
         const result = await engine.replaceDerivedLinks({ slug: ref.slug, sourceId,
           expectedRevision: snapshot.revision, sourceIncarnation: snapshot.sourceIncarnation }, desired,
-        { includeFrontmatter: false, preserveExisting: true, expectedEndpoints: [...new Set(desired.flatMap(row =>
+        { includeFrontmatter: false, preserveExisting: true,
+          wanted: { producers: ['body'], rows: wantedBySlug.get(ref.slug) ?? [] }, expectedEndpoints: [...new Set(desired.flatMap(row =>
           [`${row.from_source_id}\0${row.from_slug}`, `${row.to_source_id}\0${row.to_slug}`]))].map(key => {
           const endpoint = endpointMetadata.get(key)!;
           return { slug: endpoint.slug, sourceId: endpoint.source_id, revision: endpoint.knowledge_revision };
