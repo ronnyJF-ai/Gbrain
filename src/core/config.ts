@@ -1373,6 +1373,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.return_budget_default',
   'search.return_budget_conversation',
   'search.return_budget_max_remote',
+  'search.evidence_date_header', // C1: one-line date header per delivered block (default off; search/evidence-date.ts)
   'think.return_unit',
   // Models tier system (v0.31.12)
   'models.default',
@@ -1399,6 +1400,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.dream.triage',
   'models.drift',
   'models.auto_think',
+  'models.standing_questions',
   'models.think',
   'models.subagent',
   'models.expansion',
@@ -1437,6 +1439,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // src/core/facts/visibility.ts; explicit caller values always win.
   'facts.default_visibility',
   'facts.entity_inference', // #5836: write-time subject inference kill switch (subject-infer.ts)
+  'facts.candidate_fusion', // C2: 'rrf_free' (default, cosine arm) | 'interleave' (cosine + keyword; facts/single-prepare.ts)
+  'facts.supersession_thresholds', // JSON {"provider:model@dims": number | "off"} (facts/supersession-threshold.ts)
   // Ambient memory writeback (opt-in, default OFF): 'off' | 'salient' | 'all'.
   // DUAL-PLANE: `gbrain config set` writes the DB plane (authoritative — the
   // serve-side harvest gate re-checks it) AND mirrors into the file plane's
