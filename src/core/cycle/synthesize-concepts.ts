@@ -327,7 +327,7 @@ export async function runPhaseSynthesizeConcepts(
     }
     tierCounts[group.tier]++;
     let narrative: string;
-    let synthesisMode: ConceptSynthesisMode;
+    let synthesisMode: ConceptSynthesisMode, unverifiedClaims: UnverifiedClaim[] = [];
     let fallbackWriter: string | undefined;
     if (group.tier === 'T1' || group.tier === 'T2') {
       if (estimatedSpendUsd >= budgetCap) {
@@ -368,7 +368,7 @@ export async function runPhaseSynthesizeConcepts(
             1_000_000;
           const text = result.text.trim();
           if (text) {
-            narrative = text;
+            ({ narrative, unverified: unverifiedClaims } = await groundConceptNarrative(engine, text, group));
             synthesisMode = 'llm';
             if (result.fallbackFrom) fallbackWriter = result.model;
           } else {
@@ -427,7 +427,7 @@ export async function runPhaseSynthesizeConcepts(
         member_hash: fallbackWriter ? hashFor(fallbackWriter) : memberHash,
         synthesized_at: synthesizedAt,
         synthesized_by: 'synthesize_concepts-v0.41',
-        visibility: pageVisibility,
+        visibility: pageVisibility, ...(unverifiedClaims.length ? { unverified_claims: unverifiedClaims.map(c => ({ ...c, sources: ['member atoms'], detected_at: synthesizedAt.slice(0, 10) })) } : {}),
       });
       // Each managed publication is bound to the revision the narrative was
       // synthesized from, then to the previous publication's result.
@@ -618,4 +618,23 @@ function deterministicNarrative(group: AtomGroup): string {
       .map((t) => `  - ${t}`)
       .join('\n')}`
   );
+}
+
+/**
+ * Ground the narrative's quoted spans against the atom titles and bodies the
+ * prompt carried (quotes only: a concept narrative may count or compare).
+ * A claim unit with an unverified quote is removed from the narrative and
+ * kept in frontmatter `unverified_claims`. Opt-in: dream.quote_verify (default off).
+ */
+type UnverifiedClaim = { text: string; reason: string; detail: string };
+async function groundConceptNarrative(engine: BrainEngine, narrative: string, group: { atomTitles: string[]; atomBodies: string[] }):
+  Promise<{ narrative: string; unverified: UnverifiedClaim[] }> {
+  const { ALL_CLAIMS_QUARANTINED_BODY, dreamQuoteVerifyEnabled, groundSource, verifyBody } = await import('./synthesize-verify.ts');
+  if (!await dreamQuoteVerifyEnabled(engine)) return { narrative, unverified: [] };
+  const sources = [
+    groundSource('concept-atom-titles', group.atomTitles.slice(0, 10).join('\n'), { tolerant: true }),
+    ...group.atomBodies.slice(0, 5).map((b, i) => groundSource(`concept-atom-${i + 1}`, b.slice(0, 500), { tolerant: true })),
+  ];
+  const v = verifyBody(narrative, sources, { checks: 'quotes' });
+  return { narrative: v.body.trim() || ALL_CLAIMS_QUARANTINED_BODY, unverified: v.quarantined };
 }
